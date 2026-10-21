@@ -53,6 +53,7 @@ class ActivityWatch {
     private _lastFilePath: string = '';
     private _lastHeartbeatTime: number = 0; // Date.getTime()
     private _lastBranch: string = '';
+    private _lastEditorUri: Uri | undefined;
 
     constructor() {
         this._bucket = {
@@ -131,6 +132,9 @@ class ActivityWatch {
         // Create and send heartbeat
         try {
             const heartbeat = this._createHeartbeat();
+            if (!heartbeat) {
+                return;
+            }
             const filePath = heartbeat.data.file;
             const curTime = new Date().getTime();
             const branch = this._getCurrentBranch();
@@ -158,21 +162,27 @@ class ActivityWatch {
             });
     }
 
-    private _createHeartbeat(): IAppEditorEvent {
+    private _createHeartbeat(): IAppEditorEvent | undefined {
         // Without a text editor, describe the active tab instead (webviews, terminals, custom editors).
-        const tab = window.activeTextEditor ? undefined : this._getActiveTab();
-        if (tab) {
+        if (!window.activeTextEditor) {
+            const tab = this._getActiveTab();
+            const kind = tab && this._getTabKind(tab);
+            // Sending nothing here keeps the previous event open; an 'unknown' heartbeat would split it in two.
+            if (!tab || !kind || kind === 'unknown') {
+                return;
+            }
             return {
                 timestamp: new Date(),
                 duration: 0,
                 data: {
-                    language: this._getTabKind(tab),
-                    project: this._getWorkspaceFolder() || 'unknown',
+                    language: kind,
+                    project: this._getTabProject(tab) || 'unknown',
                     file: this._getTabFile(tab),
                     branch: this._getCurrentBranch() || 'unknown'
                 }
             };
         }
+        this._lastEditorUri = window.activeTextEditor.document.uri;
         return {
             timestamp: new Date(),
             duration: 0,
@@ -213,14 +223,25 @@ class ActivityWatch {
         return 'unknown';
     }
 
-    private _getTabFile(tab: Tab): string {
+    private _getTabUri(tab: Tab): Uri | undefined {
         const input = tab.input as any;
-        return input?.uri?.fsPath || tab.label;
+        return input?.uri instanceof Uri ? input.uri : undefined;
     }
 
-    private _getWorkspaceFolder(): string | undefined {
+    private _getTabFile(tab: Tab): string {
+        return this._getTabUri(tab)?.fsPath || tab.label;
+    }
+
+    private _getTabProject(tab: Tab): string | undefined {
+        // Use the tab's own file, then the file last edited, and only guess when the window has a single folder.
+        for (const uri of [this._getTabUri(tab), this._lastEditorUri]) {
+            const folder = uri && workspace.getWorkspaceFolder(uri);
+            if (folder) {
+                return folder.uri.path;
+            }
+        }
         const folders = workspace.workspaceFolders;
-        return folders && folders.length > 0 ? folders[0].uri.path : undefined;
+        return folders && folders.length === 1 ? folders[0].uri.path : undefined;
     }
 
     private _getProjectFolder(): string | undefined {
