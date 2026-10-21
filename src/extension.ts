@@ -1,7 +1,7 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the necessary extensibility types to use in your code below
 import * as vscode from 'vscode';
-import { Disposable, Event, ExtensionContext, commands, window, workspace, Uri, Extension, extensions } from 'vscode';
+import { Disposable, Event, ExtensionContext, TextEditor, commands, window, workspace, Uri, Extension, extensions } from 'vscode';
 import { AWClient, IAppEditorEvent } from '../aw-client-js/src/aw-client';
 import { hostname } from 'os';
 import { API, GitExtension } from './git';
@@ -49,11 +49,13 @@ class ActivityWatch {
 
     // Heartbeat handling
     private _pulseTime: number = 20;
+    private _inputTimeout: number = 180; // seconds, matching aw-watcher-afk
     private _maxHeartbeatsPerSec: number = 1;
     private _lastFilePath: string = '';
     private _lastHeartbeatTime: number = 0; // Date.getTime()
     private _lastBranch: string = '';
     private _lastEditorUri: Uri | undefined;
+    private _lastEditorInput: number = 0; // Date.getTime()
 
     constructor() {
         this._bucket = {
@@ -69,7 +71,8 @@ class ActivityWatch {
 
         // subscribe to VS Code Events
         let subscriptions: Disposable[] = [];
-        window.onDidChangeTextEditorSelection(this._onEvent, this, subscriptions);
+        window.onDidChangeTextEditorSelection(this._onEditorInput, this, subscriptions);
+        window.onDidChangeTextEditorVisibleRanges(this._onEditorInput, this, subscriptions);
         window.onDidChangeActiveTextEditor(this._onEvent, this, subscriptions);
         window.onDidChangeWindowState(this._onEvent, this, subscriptions);
         const tabGroups = this._getTabGroups();
@@ -124,8 +127,19 @@ class ActivityWatch {
         this._disposable.dispose();
     }
 
+    private _onEditorInput() {
+        this._lastEditorInput = new Date().getTime();
+        this._onEvent();
+    }
+
     private _onEvent() {
-        if (!this._bucketCreated || !window.state.focused) {
+        // The 'active' flag arrived in VS Code 1.89 and is undefined on older hosts.
+        if (!this._bucketCreated || !window.state.focused || (window.state as any).active === false) {
+            return;
+        }
+
+        // An editor left open while working elsewhere in the window, such as a chat sidebar, must not keep accruing.
+        if (this._getActiveEditor() && this._lastEditorInput + this._inputTimeout * 1000 < new Date().getTime()) {
             return;
         }
 
@@ -164,7 +178,8 @@ class ActivityWatch {
 
     private _createHeartbeat(): IAppEditorEvent | undefined {
         // Without a text editor, describe the active tab instead (webviews, terminals, custom editors).
-        if (!window.activeTextEditor) {
+        const editor = this._getActiveEditor();
+        if (!editor) {
             const tab = this._getActiveTab();
             const kind = tab && this._getTabKind(tab);
             // Sending nothing here keeps the previous event open; an 'unknown' heartbeat would split it in two.
@@ -182,7 +197,9 @@ class ActivityWatch {
                 }
             };
         }
-        this._lastEditorUri = window.activeTextEditor.document.uri;
+        if (workspace.getWorkspaceFolder(editor.document.uri)) {
+            this._lastEditorUri = editor.document.uri;
+        }
         return {
             timestamp: new Date(),
             duration: 0,
@@ -193,6 +210,16 @@ class ActivityWatch {
                 branch: this._getCurrentBranch() || 'unknown'
             }
         };
+    }
+
+    private _getActiveEditor(): TextEditor | undefined {
+        // Buffers outside the workspace that are not files, such as an agent's tool output, have no project to report.
+        const editor = window.activeTextEditor;
+        const uri = editor?.document.uri;
+        if (!editor || !uri || (!workspace.getWorkspaceFolder(uri) && uri.scheme !== 'file' && uri.scheme !== 'untitled')) {
+            return;
+        }
+        return editor;
     }
 
     private _getTabGroups(): TabGroups | undefined {
