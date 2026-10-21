@@ -1,9 +1,22 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the necessary extensibility types to use in your code below
-import { Disposable, ExtensionContext, commands, window, workspace, Uri, Extension, extensions } from 'vscode';
+import * as vscode from 'vscode';
+import { Disposable, Event, ExtensionContext, commands, window, workspace, Uri, Extension, extensions } from 'vscode';
 import { AWClient, IAppEditorEvent } from '../aw-client-js/src/aw-client';
 import { hostname } from 'os';
 import { API, GitExtension } from './git';
+
+// The tab API arrived in VS Code 1.67, after the engine version this extension targets,
+// so the few parts used here are declared locally and checked for at runtime.
+interface Tab {
+    label: string;
+    input: unknown;
+}
+interface TabGroups {
+    activeTabGroup: { activeTab: Tab | undefined };
+    onDidChangeTabs: Event<unknown>;
+    onDidChangeTabGroups: Event<unknown>;
+}
 
 // This method is called when your extension is activated. Activation is
 // controlled by the activation events defined in package.json.
@@ -57,6 +70,18 @@ class ActivityWatch {
         let subscriptions: Disposable[] = [];
         window.onDidChangeTextEditorSelection(this._onEvent, this, subscriptions);
         window.onDidChangeActiveTextEditor(this._onEvent, this, subscriptions);
+        window.onDidChangeWindowState(this._onEvent, this, subscriptions);
+        const tabGroups = this._getTabGroups();
+        if (tabGroups) {
+            tabGroups.onDidChangeTabs(this._onEvent, this, subscriptions);
+            tabGroups.onDidChangeTabGroups(this._onEvent, this, subscriptions);
+        }
+
+        // Keep time accruing while the window has focus but nothing in it changes,
+        // such as reading a file, watching a terminal or using a chat view.
+        const focusedPulse = setInterval(() => this._onEvent(), this._pulseTime * 1000 / 2);
+        subscriptions.push(new Disposable(() => clearInterval(focusedPulse)));
+
         this._disposable = Disposable.from(...subscriptions);
     }
 
@@ -99,14 +124,14 @@ class ActivityWatch {
     }
 
     private _onEvent() {
-        if (!this._bucketCreated) {
+        if (!this._bucketCreated || !window.state.focused) {
             return;
         }
 
         // Create and send heartbeat
         try {
             const heartbeat = this._createHeartbeat();
-            const filePath = this._getFilePath();
+            const filePath = heartbeat.data.file;
             const curTime = new Date().getTime();
             const branch = this._getCurrentBranch();
 
@@ -134,6 +159,20 @@ class ActivityWatch {
     }
 
     private _createHeartbeat(): IAppEditorEvent {
+        // Without a text editor, describe the active tab instead (webviews, terminals, custom editors).
+        const tab = window.activeTextEditor ? undefined : this._getActiveTab();
+        if (tab) {
+            return {
+                timestamp: new Date(),
+                duration: 0,
+                data: {
+                    language: this._getTabKind(tab),
+                    project: this._getWorkspaceFolder() || 'unknown',
+                    file: this._getTabFile(tab),
+                    branch: this._getCurrentBranch() || 'unknown'
+                }
+            };
+        }
         return {
             timestamp: new Date(),
             duration: 0,
@@ -144,6 +183,44 @@ class ActivityWatch {
                 branch: this._getCurrentBranch() || 'unknown'
             }
         };
+    }
+
+    private _getTabGroups(): TabGroups | undefined {
+        return (window as any).tabGroups;
+    }
+
+    private _getActiveTab(): Tab | undefined {
+        const tabGroups = this._getTabGroups();
+        return tabGroups?.activeTabGroup?.activeTab;
+    }
+
+    private _getTabKind(tab: Tab): string {
+        const api = vscode as any;
+        const input = tab.input as any;
+        if (api.TabInputWebview && input instanceof api.TabInputWebview) {
+            // Webview tabs report their view type with an internal prefix in front.
+            return `webview:${input.viewType.replace(/^mainThreadWebview-/, '')}`;
+        }
+        if (api.TabInputTerminal && input instanceof api.TabInputTerminal) {
+            return 'terminal';
+        }
+        if (api.TabInputCustom && input instanceof api.TabInputCustom) {
+            return `custom:${input.viewType}`;
+        }
+        if (api.TabInputNotebook && input instanceof api.TabInputNotebook) {
+            return `notebook:${input.notebookType}`;
+        }
+        return 'unknown';
+    }
+
+    private _getTabFile(tab: Tab): string {
+        const input = tab.input as any;
+        return input?.uri?.fsPath || tab.label;
+    }
+
+    private _getWorkspaceFolder(): string | undefined {
+        const folders = workspace.workspaceFolders;
+        return folders && folders.length > 0 ? folders[0].uri.path : undefined;
     }
 
     private _getProjectFolder(): string | undefined {
